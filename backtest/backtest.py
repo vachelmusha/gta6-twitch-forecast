@@ -2,6 +2,9 @@
 
 Usage: python3 backtest/backtest.py [kit_input_dir] [variant,variant,...]
 
+kit_input_dir defaults to $MAKEFUN_KIT_INPUT, else the first gta/gta6-twitch-ccu-forecast-01-kit/input
+found beside this repository or any directory above it (a git worktree sits deeper than the checkout).
+
 Each launch in the union of the practice cases' comparables becomes a pseudo-case:
 hour 1's count is known, hours 2..24 are the answer. Every candidate is fitted on the
 other launches only, and its spread comes from residuals that also exclude the target.
@@ -16,8 +19,25 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import main  # noqa: E402
 
-DEFAULT_KIT_INPUT = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "..", "gta", "gta6-twitch-ccu-forecast-01-kit", "input")
+KIT_INPUT_TAIL = os.path.join("gta", "gta6-twitch-ccu-forecast-01-kit", "input")
+
+
+def find_kit_input():
+    env = os.environ.get("MAKEFUN_KIT_INPUT")
+    if env:
+        return env
+    d = os.path.dirname(os.path.abspath(__file__))
+    while True:
+        cand = os.path.join(d, KIT_INPUT_TAIL)
+        if glob.glob(os.path.join(cand, "*.in")):
+            return cand
+        parent = os.path.dirname(d)
+        if parent == d:
+            return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", KIT_INPUT_TAIL)
+        d = parent
+
+
+DEFAULT_KIT_INPUT = find_kit_input()
 
 
 def load_comparables(kit_input):
@@ -62,7 +82,7 @@ def score(launch, fc):
     for h, lr in launch["logratio"].items():
         y = p * math.exp(lr)
         losses.append(pinball(y, rows[h]))
-        hits.append(rows[h][0] <= y <= rows[h][4])
+        hits.append((rows[h][0] <= y <= rows[h][4], rows[h][1] <= y <= rows[h][3], h))
     return losses, hits
 
 
@@ -70,35 +90,23 @@ def flat_weights(launches):
     return [dict(L, weight=1.0) for L in launches]
 
 
-BASE = dict(main.CONFIG, center="mean", feature=None, ridge=1.0, pool=2, spread="empirical", wpow=1.0, size_bw=None)
+BASE = dict(main.CONFIG, center="mean", feature=None, pool=2, spread="empirical", wpow=1.0, size_bw=1.5,
+            align="none", shrink=0.0, inner=1.0)
+US = dict(BASE, align="us")
 
 VARIANTS = {
     "house_baseline": None,
-    "house_like_ratio_spread": dict(BASE, spread="normal", flat=True),
     "chosen (main.CONFIG)": dict(main.CONFIG),
-    "prior_weights": dict(BASE),
-    "prior_median": dict(BASE, center="median"),
-    "prior_normal": dict(BASE, spread="normal"),
-    "prior_reg_jump": dict(BASE, feature="jump"),
-    "prior_reg_over_eve": dict(BASE, feature="over_eve"),
-    "prior_reg_eve_growth": dict(BASE, feature="eve_growth"),
-    "prior_reg_over_peak": dict(BASE, feature="over_peak"),
-    "prior_reg_over_peak48": dict(BASE, feature="over_peak48"),
-    "prior2": dict(BASE, wpow=2.0),
-    "prior2_reg_over_peak": dict(BASE, wpow=2.0, feature="over_peak"),
-    "size1": dict(BASE, size_bw=1.0),
-    "size1.5": dict(BASE, size_bw=1.5),
-    "size2": dict(BASE, size_bw=2.0),
-    "size2.5": dict(BASE, size_bw=2.5),
-    "size1.5_flatprior": dict(BASE, size_bw=1.5, flat=True),
-    "size1.5_prior2": dict(BASE, size_bw=1.5, wpow=2.0),
-    "size1.5_median": dict(BASE, size_bw=1.5, center="median"),
-    "size1.5_normal": dict(BASE, size_bw=1.5, spread="normal"),
-    "size1.5_pool1": dict(BASE, size_bw=1.5, pool=1),
-    "size1.5_pool3": dict(BASE, size_bw=1.5, pool=3),
-    "size1.5_reg_jump": dict(BASE, size_bw=1.5, feature="jump"),
-    "size1.5_reg_over_eve": dict(BASE, size_bw=1.5, feature="over_eve"),
-    "size1.5_reg_over_peak": dict(BASE, size_bw=1.5, feature="over_peak"),
+    "old size1.5": dict(BASE),
+    "us": US,
+    "us_ref": dict(BASE, align="us_ref"),
+    "us_inner0.75": dict(US, inner=0.75),
+    "us_shrink0.25": dict(US, shrink=0.25),
+    "us_i.75_s.25_median": dict(US, inner=0.75, shrink=0.25, center="median"),
+    "us_i.75_s.25_jump": dict(US, inner=0.75, shrink=0.25, feature="jump"),
+    "us_i.75_s.25_over_eve": dict(US, inner=0.75, shrink=0.25, feature="over_eve"),
+    "us_i.75_s.5": dict(US, inner=0.75, shrink=0.5),
+    "us_i.75_s.25_size2": dict(US, inner=0.75, shrink=0.25, size_bw=2.0),
 }
 
 
@@ -110,7 +118,7 @@ def evaluate(launches, cfg):
             fc = main.flat_forecast(L["p"])
         else:
             train = pool[:i] + pool[i + 1:]
-            fc = main.model_forecast(train, L["p"], L["feats"], cfg)
+            fc = main.model_forecast(train, L["p"], L, cfg)
         per.append((L, *score(L, fc)))
     return per
 
@@ -123,7 +131,7 @@ def summarize(per):
             if not losses or w <= 0:
                 continue
             num += w * sum(losses) / len(losses)
-            cov += w * sum(hits) / len(hits)
+            cov += w * sum(x[0] for x in hits) / len(hits)
             den += w
         return num / den, cov / den
     rolling = [r for r in per if r[0]["weight"] >= 0.7]
@@ -133,9 +141,22 @@ def summarize(per):
     return all_l, all_c, w_l, w_c, r_l, r_c, len(rolling)
 
 
+def calibration(per):
+    """Coverage of the 5-95 and 25-75 bands by horizon block, all launches and the GTA-like subset."""
+    blocks = ((2, 5), (6, 9), (10, 16), (17, 24))
+    for label, rows in (("all", per), ("gta", [r for r in per if r[0]["weight"] >= 0.7])):
+        cells = []
+        for lo, hi in blocks:
+            hs = [x for _, _, hits in rows for x in hits if lo <= x[2] <= hi]
+            cells.append(f"h{lo}-{hi} 90:{sum(x[0] for x in hs) / len(hs):.2f} 50:{sum(x[1] for x in hs) / len(hs):.2f}")
+        print(f"    {label:4s} " + "  ".join(cells))
+
+
 def main_cli():
     kit_input = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else DEFAULT_KIT_INPUT
     launches = load_launches(kit_input)
+    if not launches:
+        sys.exit(f"0 launches read from {kit_input}: pass the kit's input/ or set MAKEFUN_KIT_INPUT")
     names = sys.argv[2].split(",") if len(sys.argv) > 2 else list(VARIANTS)
     print(f"{len(launches)} launches; GTA-like subset = prior weight >= 0.7")
     print(f"{'variant':28s} {'loss_all':>9s} {'cov_all':>8s} {'loss_wtd':>9s} {'cov_wtd':>8s} {'loss_gta':>9s} {'cov_gta':>8s}")
@@ -145,7 +166,9 @@ def main_cli():
         if os.environ.get("PER_LAUNCH"):
             for L, losses, hits in per:
                 if L["weight"] >= 0.7:
-                    print(f"    {L['name'][:30]:30s} {sum(losses) / len(losses):.3f} cov {sum(hits) / len(hits):.2f}")
+                    print(f"    {L['name'][:30]:30s} {sum(losses) / len(losses):.3f} cov {sum(x[0] for x in hits) / len(hits):.2f}")
+        if os.environ.get("CALIBRATION"):
+            calibration(per)
         print(f"{name:28s} {s[0]:9.4f} {s[1]:8.3f} {s[2]:9.4f} {s[3]:8.3f} {s[4]:9.4f} {s[5]:8.3f}  (n_gta={s[6]})")
 
 
